@@ -16,7 +16,7 @@ def turn_on(light_id):
 def main():
     start = time.perf_counter()
 
-    # เปิดไฟทีละดวงตามลำดับ 1 → 2 → 3 → 4
+    # เปิดไฟทีละดวงตามลำดับ 1  2  3  4
     for light_id in LIGHT_IDS:
         turn_on(light_id)
 
