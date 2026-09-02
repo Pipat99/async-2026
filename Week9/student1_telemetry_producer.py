@@ -5,17 +5,21 @@ import json
 import redis.asyncio as redis
 
 # ⚙️ CONFIGURATION
-REDIS_HOST = 'localhost'     # IP ของ Redis Server (เครื่องครู)
-GROUP_ID = 'g01'             # เลขกลุ่ม เช่น g01 - g08
-STUDENT_ID = '66010001'      # รหัสนักศึกษาตนเอง
+REDIS_HOST = '172.16.46.79'  # IP ของ Redis Server (เครื่องครู) — ใส่เฉพาะ IP ห้ามมี ':port' ปนอยู่ในนี้       # Port ของ Redis Server (เครื่องครูแจ้ง 8088 ไม่ใช่ default 6379)
+GROUP_ID = 'g07'             # เลขกลุ่ม เช่น g01 - g08
+STUDENT_ID = '6710301003'    # รหัสนักศึกษาตนเอง
 
 STREAM_KEY = f"f1:telemetry:{GROUP_ID}"
 FINISH_DISTANCE = 10000.0    # 10,000 เมตร (10 km)
 
+# 🔧 PERFORMANCE TUNING (ไม่แตะ speed / สูตรคำนวณ distance / dt)
+PRINT_EVERY_N = 20           # print ออก terminal ทุกๆ N ข้อความ แทนทุกข้อความ (ลด I/O overhead)
+
+
 async def wait_for_new_green_light(r: redis.Redis):
     """ฟังก์ชันการันตีว่าจะต้องรอครูปดสัญญาณปล่อยตัวรอบใหม่เสมอ"""
     print(f"🏎️ [{GROUP_ID}] Checking Race Status...")
-    
+
     # 1. หากสถานะปัจจุบันเป็น GREEN ค้างอยู่ (แข่งจบไปแล้วรอบนึง) ให้รอกระทั่งครู Reset เป็น STOPPED/RED
     current_status = await r.get("f1:race:status")
     if current_status == "GREEN":
@@ -35,20 +39,29 @@ async def wait_for_new_green_light(r: redis.Redis):
             break
         await asyncio.sleep(0.2)
 
+
 async def produce_f1_telemetry():
     r = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
+
+    # 🔥 WARM-UP: เปิด connection / TCP handshake ให้เสร็จตั้งแต่ตอนรอไฟเขียว
+    # ป้องกันไม่ให้ handshake ไปแทรกอยู่ในรอบแรกๆ ของการแข่งขันจริง
+    await r.ping()
 
     # 🚦 เรียกใช้ฟังก์ชันรอสัญญาณปล่อยตัวรอบใหม่เสมอ
     await wait_for_new_green_light(r)
 
     total_distance_m = 0.0
-    dt = 0.05  # ส่งข้อมูลทุก 0.05 วินาที (20 Hz)
+    dt = 0.05  # ส่งข้อมูลทุก 0.05 วินาที (20 Hz) — ค่าคงที่ ห้ามแก้
+
+    tick_count = 0
 
     try:
         while True:
-            speed_kmh = round(random.uniform(180.0, 330.0), 1)
-            
-            # คำนวณระยะทางที่เพิ่มขึ้นใน 0.05 วินาที
+            loop_start = time.monotonic()  # จับเวลาเริ่ม tick นี้ (สำหรับชดเชย drift ท้าย loop)
+
+            speed_kmh = round(random.uniform(180.0, 330.0), 1)  # ห้ามแก้ช่วงความเร็ว
+
+            # คำนวณระยะทางที่เพิ่มขึ้นใน 0.05 วินาที (สูตรเดิม ห้ามแก้)
             distance_delta = (speed_kmh * 1000.0 / 3600.0) * dt
             total_distance_m += distance_delta
 
@@ -64,7 +77,11 @@ async def produce_f1_telemetry():
 
             # ส่งข้อมูลเข้า Redis Stream
             msg_id = await r.xadd(STREAM_KEY, payload, maxlen=1000, approximate=True)
-            print(f"🏎️ [{GROUP_ID}] Sent ID: {msg_id} | Speed: {speed_kmh} km/h | Dist: {total_distance_m:.1f} m")
+
+            tick_count += 1
+            # ลด overhead จาก print: แสดงผลแค่ทุกๆ N ข้อความ (ไม่กระทบข้อมูลที่ส่งจริง)
+            if tick_count % PRINT_EVERY_N == 0:
+                print(f"🏎️ [{GROUP_ID}] Sent ID: {msg_id} | Speed: {speed_kmh} km/h | Dist: {total_distance_m:.1f} m")
 
             # เช็กการเข้าเส้นชัย
             if total_distance_m >= FINISH_DISTANCE:
@@ -72,7 +89,10 @@ async def produce_f1_telemetry():
                 await r.publish("f1:race:finish", json.dumps({"group_id": GROUP_ID}))
                 break
 
-            await asyncio.sleep(dt)
+            # ✅ FIX: หัก "เวลาที่ใช้ไปแล้วในรอบนี้" (เช่นเวลา round-trip ของ xadd) ออกจาก sleep
+            # เดิม: await asyncio.sleep(dt) ทำให้แต่ละรอบยาวกว่า dt เสมอ (dt + network time)
+            elapsed = time.monotonic() - loop_start
+            await asyncio.sleep(max(0.0, dt - elapsed))
     except asyncio.CancelledError:
         await r.close()
 
